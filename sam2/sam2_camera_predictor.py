@@ -202,20 +202,26 @@ class SAM2CameraPredictor(SAM2Base):
             bbox is not None or points is not None
         ), "Either bbox or points is required"
 
-        if bbox is not None:
-            if not isinstance(bbox, torch.Tensor):
-                points = torch.tensor(bbox, dtype=torch.float32)
-            labels = torch.tensor([2, 3], dtype=torch.int32)
-        else:
-            if not isinstance(points, torch.Tensor):
-                points = torch.tensor(points, dtype=torch.float32)
-            if not isinstance(labels, torch.Tensor):
-                labels = torch.tensor(labels, dtype=torch.int32)
+        if points is None:
+            points = torch.zeros(0, 2, dtype=torch.float32)
+        elif not isinstance(points, torch.Tensor):
+            points = torch.tensor(points, dtype=torch.float32)
+        if labels is None:
+            labels = torch.zeros(0, dtype=torch.int32)
+        elif not isinstance(labels, torch.Tensor):
+            labels = torch.tensor(labels, dtype=torch.int32)
         if points.dim() == 2:
             points = points.unsqueeze(0)  # add batch dimension
         if labels.dim() == 1:
             labels = labels.unsqueeze(0)  # add batch dimension
-
+        if bbox is not None:
+            if not isinstance(bbox, torch.Tensor):
+                    bbox = torch.tensor(bbox, dtype=torch.float32, device=points.device)
+                    box_coords = bbox.reshape(1, 2, 2)
+                    box_labels = torch.tensor([2, 3], dtype=torch.int32, device=labels.device)
+                    box_labels = box_labels.reshape(1, 2)
+                    points = torch.cat([box_coords, points], dim=1)
+                    labels = torch.cat([box_labels, labels], dim=1)
         if normalize_coords:
             video_H = self.condition_state["video_height"]
             video_W = self.condition_state["video_width"]
@@ -390,6 +396,91 @@ class SAM2CameraPredictor(SAM2Base):
             # them into memory.
             run_mem_encoder=False,
             prev_sam_mask_logits=prev_sam_mask_logits,
+        )
+        # Add the output to the output dict (to be used as future memory)
+        obj_temp_output_dict[storage_key][frame_idx] = current_out
+
+        # Resize the output mask to the original video resolution
+        obj_ids = self.condition_state["obj_ids"]
+        consolidated_out = self._consolidate_temp_output_across_obj(
+            frame_idx,
+            is_cond=is_cond,
+            run_mem_encoder=False,
+            consolidate_at_video_res=True,
+        )
+        _, video_res_masks = self._get_orig_video_res_output(
+            consolidated_out["pred_masks_video_res"]
+        )
+        return frame_idx, obj_ids, video_res_masks
+
+    @torch.inference_mode()
+    def add_new_mask(
+        self,
+        frame_idx,
+        obj_id,
+        mask,
+    ):
+        """Add new mask to a frame."""
+        obj_idx = self._obj_id_to_idx(obj_id)
+        point_inputs_per_frame = self.condition_state["point_inputs_per_obj"][obj_idx]
+        mask_inputs_per_frame = self.condition_state["mask_inputs_per_obj"][obj_idx]
+
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.tensor(mask, dtype=torch.bool)
+        assert mask.dim() == 2
+        mask_H, mask_W = mask.shape
+        mask_inputs_orig = mask[None, None]  # add batch and channel dimension
+        mask_inputs_orig = mask_inputs_orig.float().to(self.condition_state["device"])
+
+        # resize the mask if it doesn't match the model's image size
+        if mask_H != self.image_size or mask_W != self.image_size:
+            mask_inputs = torch.nn.functional.interpolate(
+                mask_inputs_orig,
+                size=(self.image_size, self.image_size),
+                align_corners=False,
+                mode="bilinear",
+                antialias=True,  # use antialias for downsampling
+            )
+            mask_inputs = (mask_inputs >= 0.5).float()
+        else:
+            mask_inputs = mask_inputs_orig
+
+        mask_inputs_per_frame[frame_idx] = mask_inputs
+        point_inputs_per_frame.pop(frame_idx, None)
+        # If this frame hasn't been tracked before, we treat it as an initial conditioning
+        # frame, meaning that the inputs points are to generate segments on this frame without
+        # using any memory from other frames, like in SAM. Otherwise (if it has been tracked),
+        # the input points will be used to correct the already tracked masks.
+        is_init_cond_frame = (
+            frame_idx not in self.condition_state["frames_already_tracked"]
+        )
+        # whether to track in reverse time order
+        if is_init_cond_frame:
+            reverse = False
+        else:
+            reverse = self.condition_state["frames_already_tracked"][frame_idx][
+                "reverse"
+            ]
+        obj_output_dict = self.condition_state["output_dict_per_obj"][obj_idx]
+        obj_temp_output_dict = self.condition_state["temp_output_dict_per_obj"][obj_idx]
+        # Add a frame to conditioning output if it's an initial conditioning frame or
+        # if the model sees all frames receiving clicks/mask as conditioning frames.
+        is_cond = is_init_cond_frame or self.add_all_frames_to_correct_as_cond
+        storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
+
+        current_out, _ = self._run_single_frame_inference(
+            output_dict=obj_output_dict,  # run on the slice of a single object
+            frame_idx=frame_idx,
+            batch_size=1,  # run on the slice of a single object
+            is_init_cond_frame=is_init_cond_frame,
+            point_inputs=None,
+            mask_inputs=mask_inputs,
+            reverse=reverse,
+            # Skip the memory encoder when adding clicks or mask. We execute the memory encoder
+            # at the beginning of `propagate_in_video` (after user finalize their clicks). This
+            # allows us to enforce non-overlapping constraints on all objects before encoding
+            # them into memory.
+            run_mem_encoder=False,
         )
         # Add the output to the output dict (to be used as future memory)
         obj_temp_output_dict[storage_key][frame_idx] = current_out

@@ -235,9 +235,9 @@ class Attention(nn.Module):
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         # Input projections
-        q = self.q_proj(q)
-        k = self.k_proj(k)
-        v = self.v_proj(v)
+        q = self.q_proj(q).half()
+        k = self.k_proj(k).half()
+        v = self.v_proj(v).half()
 
         # Separate into heads
         q = self._separate_heads(q, self.num_heads)
@@ -254,7 +254,7 @@ class Attention(nn.Module):
         ):
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
-        out = self._recombine_heads(out)
+        out = self._recombine_heads(out).float()
         out = self.out_proj(out)
 
         return out
@@ -286,9 +286,9 @@ class RoPEAttention(Attention):
         self, q: Tensor, k: Tensor, v: Tensor, num_k_exclude_rope: int = 0
     ) -> Tensor:
         # Input projections
-        q = self.q_proj(q)
-        k = self.k_proj(k)
-        v = self.v_proj(v)
+        q = self.q_proj(q).half()
+        k = self.k_proj(k).half()
+        v = self.v_proj(v).half()
 
         # Separate into heads
         q = self._separate_heads(q, self.num_heads)
@@ -321,7 +321,7 @@ class RoPEAttention(Attention):
         ):
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
-        out = self._recombine_heads(out)
+        out = self._recombine_heads(out).float()
         out = self.out_proj(out)
 
         return out
